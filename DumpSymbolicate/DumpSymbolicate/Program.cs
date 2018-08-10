@@ -11,47 +11,11 @@ using Mono.Cecil.Cil;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json;
 
-
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace DumpSymbolicate
 {
-    
-    internal class MonoStateRuntime
-    {
-        internal string Version;
-
-        internal MonoStateThread[] Threads;
-
-        public MonoStateRuntime (string version, MonoStateThread [] threads)
-        {
-            Version = version;
-            Threads = threads;
-        }
-
-        public void Emit ()
-        {
-            StringBuilder sb = new StringBuilder();
-            StringWriter sw = new StringWriter(sb);
-
-            using (JsonWriter writer = new JsonTextWriter(sw))
-            {
-                writer.Formatting = Formatting.Indented;
-
-                writer.WriteStartObject();
-                writer.WritePropertyName("Version");
-                writer.WriteValue(this.Version);
-                writer.WritePropertyName("Threads");
-                writer.WriteStartArray();
-
-                foreach (var thread in Threads)
-                    thread.Emit(writer);
-
-                writer.WriteEnd();
-                writer.WriteEndObject();
-            }
-        }
-    }
 
     internal class MonoStateThread
     {
@@ -180,7 +144,7 @@ namespace DumpSymbolicate
             frame.klass = typ.Item2;
             frame.function = typ.Item3;
 
-            Console.WriteLine("Made frame: {0} {1} {2} {3} {4}", frame.assembly, frame.klass, frame.function, frame.file, frame.start_line);
+            // Console.WriteLine("Made frame: {0} {1} {2} {3} {4}", frame.assembly, frame.klass, frame.function, frame.file, frame.start_line);
         }
     }
 
@@ -246,6 +210,30 @@ namespace DumpSymbolicate
                 }
             }
         }
+
+        public string Emit()
+        {
+            StringBuilder sb = new StringBuilder();
+            StringWriter sw = new StringWriter(sb);
+
+            using (JsonWriter writer = new JsonTextWriter(sw))
+            {
+                writer.Formatting = Formatting.Indented;
+
+                writer.WriteStartObject();
+                writer.WritePropertyName("Threads");
+                writer.WriteStartArray();
+
+                foreach (var thread in Threads)
+                    if (thread != null)
+                        thread.Emit(writer);
+
+                writer.WriteEnd();
+                writer.WriteEndObject();
+            }
+
+            return sb.ToString();
+        }
     }
 
     class Symbolicator
@@ -271,6 +259,32 @@ namespace DumpSymbolicate
             this.guid_lookup = new Dictionary<string, Assembly>();
         }
 
+        // Here is where we put any workarounds for file format issues
+        public static JObject TryReadJson (string filePath)
+        {
+            var allText = File.ReadAllText(filePath);
+            // Console.WriteLine("Read in: {0}", outputStr);
+            // Console.ReadLine();
+            JObject crashFile = null;
+            try
+            {
+                crashFile = JObject.Parse(allText);
+            }
+            catch (JsonReaderException)
+            {
+                // This is a fix for version 1.0 of the merp crash dump format
+
+                var cleaned = Regex.Replace (allText, "\\n    \"EventType:\"", ",\n    \"EventType:\"");
+                try {
+                    crashFile = JObject.Parse(cleaned);
+                } catch (JsonReaderException) {
+                    throw new Exception("Could not parse input file even with workarounds for known issues");
+                }
+            }
+
+            return crashFile;
+        }
+
         public static void Main(string[] args)
         {
             if (args.Length < 1)
@@ -281,16 +295,13 @@ namespace DumpSymbolicate
 
             if (args.Length < 2)
                 throw new Exception("Symbolcation folder not provided");
+            
+            var crashFile = Symbolicator.TryReadJson(args[0]);
 
-            var outputStr = File.ReadAllText(args[0]);
-            Console.WriteLine("Read in: {0}", outputStr);
-            Console.ReadLine();
-            var crashFile = JObject.Parse(outputStr);
             var request = new SymbolicationRequest(crashFile);
 
             var inputFolder = args[1];
             string[] assemblies = Directory.GetFiles(inputFolder);
-            var self = new Symbolicator ();
 
             var mapping = new CodeCollection ();
 
@@ -299,20 +310,20 @@ namespace DumpSymbolicate
             {
                 if (assembly.EndsWith(".dll") || assembly.EndsWith(".exe")) 
                 {
-                    Console.WriteLine("Reading {0}", assembly);
+                    // Console.WriteLine("Reading {0}", assembly);
                     var readerParameters = new ReaderParameters { ReadSymbols = true };
                     AssemblyDefinition myLibrary = null;
                     try {
                          myLibrary = AssemblyDefinition.ReadAssembly (assembly, readerParameters);
                     } catch (Exception e) {
-                        Console.WriteLine("Error parsing assembly {1}: {0}", e.Message, assembly);
+                        // Console.WriteLine("Error parsing assembly {1}: {0}", e.Message, assembly);
                         continue;
                     }
 
                     string mvid = myLibrary.MainModule.Mvid.ToString ();
 
-                    Console.WriteLine("{0} {1}", assembly, mvid);
-                    Console.WriteLine("Read {0}", assembly);
+                    // Console.WriteLine("{0} {1}", assembly, mvid);
+                    // Console.WriteLine("Read {0}", assembly);
 
                     foreach (var ty in myLibrary.MainModule.Types){
                         for (int i = 0; i < ty.Methods.Count; i++)
@@ -327,6 +338,9 @@ namespace DumpSymbolicate
             }
 
             request.Process(mapping);
+            var result = request.Emit();
+
+            Console.WriteLine(result);
 
             //var MonoState = new MonoStateParser (argv [1]);
             //foreach (var thread in MonoState.Threads)
