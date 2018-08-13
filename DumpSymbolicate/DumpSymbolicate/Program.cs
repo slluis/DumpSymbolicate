@@ -14,21 +14,26 @@ using Newtonsoft.Json;
 using System.Text;
 using System.Text.RegularExpressions;
 
+using System.Diagnostics;
+
 namespace DumpSymbolicate
 {
 
     internal class MonoStateThread
     {
         // Only do managed frames for now
-        internal MonoStateManagedFrame[] Frames;
+        internal MonoStateFrame[] ManagedFrames;
+        internal MonoStateFrame[] NativeFrames;
+
         internal string Name;
 
-        public MonoStateThread (MonoStateManagedFrame[] frames, string name)
+        public MonoStateThread (MonoStateFrame[] managed_frames,  MonoStateFrame[] unmanaged_frames, string name)
         {
-            if (frames == null)
+            if (managed_frames == null)
                 throw new Exception("Only non-null frames allowed for reporting");
             
-            this.Frames = frames;
+            this.ManagedFrames = managed_frames;
+            this.NativeFrames = unmanaged_frames;
             this.Name = name;
         }
 
@@ -37,13 +42,19 @@ namespace DumpSymbolicate
             writer.WriteStartObject();
             writer.WritePropertyName("Name");
             writer.WriteValue(this.Name);
-            writer.WritePropertyName("Frames");
-            writer.WriteStartArray();
 
-            foreach (var frame in Frames)
+            writer.WritePropertyName("ManagedFrames");
+            writer.WriteStartArray();
+            foreach (var frame in ManagedFrames)
                 frame.Emit(writer);
-            
             writer.WriteEnd();
+
+            writer.WritePropertyName("NativeFrames");
+            writer.WriteStartArray();
+            foreach (var frame in NativeFrames)
+                frame.Emit(writer);
+            writer.WriteEnd();
+
             writer.WriteEndObject();
         }
 
@@ -54,10 +65,23 @@ namespace DumpSymbolicate
 
     internal abstract class MonoStateFrame
     {
+        public abstract void Emit (JsonWriter writer);
     }
 
     internal class MonoStateUnmanagedFrame : MonoStateFrame
     {
+        internal string address;
+        internal string name;
+
+        public override void Emit(JsonWriter writer)
+        {
+            writer.WriteStartObject();
+            writer.WritePropertyName("Address");
+            writer.WriteValue(address);
+            writer.WritePropertyName("Name");
+            writer.WriteValue(name);
+            writer.WriteEndObject();
+        }
     }
 
     internal class MonoStateManagedFrame : MonoStateFrame
@@ -76,22 +100,31 @@ namespace DumpSymbolicate
         internal int end_line;
         internal int end_col;
 
-        public void Emit(JsonWriter writer)
+        public override void Emit(JsonWriter writer)
         {
             writer.WriteStartObject();
 
-            writer.WritePropertyName("Assembly");
-            writer.WriteValue(this.assembly);
-            writer.WritePropertyName("Class");
-            writer.WriteValue(this.klass);
-            writer.WritePropertyName("Function");
-            writer.WriteValue(this.function);
+            if (assembly != null) {
+                writer.WritePropertyName("Assembly");
+                writer.WriteValue(this.assembly);
+                writer.WritePropertyName("Class");
+                writer.WriteValue(this.klass);
+                writer.WritePropertyName("Function");
+                writer.WriteValue(this.function);
 
-            writer.WritePropertyName("File");
-            writer.WriteValue(this.file);
-            writer.WritePropertyName("Line");
-            writer.WriteValue(this.start_line);
-                   
+                writer.WritePropertyName("File");
+                writer.WriteValue(this.file);
+                writer.WritePropertyName("Line");
+                writer.WriteValue(this.start_line);
+            } else {
+                writer.WritePropertyName("GUID");
+                writer.WriteValue(this.mvid);
+                writer.WritePropertyName("Token");
+                writer.WriteValue(this.token);
+                writer.WritePropertyName("Offset");
+                writer.WriteValue(this.offset);
+            }
+
             writer.WriteEndObject();
         }
 
@@ -101,6 +134,7 @@ namespace DumpSymbolicate
     {
         Dictionary<Tuple<string, uint>, Collection<SequencePoint>> Lookup;
         Dictionary<Tuple<string, uint>, Tuple<string, string, string>> Types;
+        public readonly string Runtime;
 
         public void Add (string assembly, string klass, string function, string mvid, uint token, Collection<SequencePoint> seqs)
         {
@@ -109,13 +143,61 @@ namespace DumpSymbolicate
             Types[key] = new Tuple<string, string, string>(assembly, klass, function);
         }
 
-        public CodeCollection ()
+        public CodeCollection (string unmanaged_mono)
         {
             Lookup = new Dictionary<Tuple<string, uint>, Collection<SequencePoint>>();
             Types = new Dictionary<Tuple<string, uint>, Tuple<string, string, string>>();
+            Runtime = unmanaged_mono;
         }
 
-        public void Enrich (MonoStateManagedFrame frame)
+        Process llvm_process;
+
+        public void InitLLvmSymbolizer ()
+        {
+            llvm_process = new Process();
+            llvm_process.StartInfo = new ProcessStartInfo
+            {
+                FileName = "llvm-symbolizer",
+                Arguments = String.Format("-obj={0} -pretty-print", Runtime),
+                UseShellExecute = false,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+            };
+            llvm_process.Start();
+        }
+
+        public void Shutdown ()
+        {
+            llvm_process.Kill ();
+        }
+
+        public void Enrich (MonoStateUnmanagedFrame frame)
+        {
+            if (frame.address == "outside mono-sgen")
+                return;
+            else
+                Console.WriteLine ("Symbolicating!");
+
+            Console.WriteLine("Process started, sending {0}", frame.address);
+
+            if (llvm_process == null)
+                InitLLvmSymbolizer ();
+
+            llvm_process.StandardInput.WriteLine(frame.address);
+            llvm_process.StandardInput.WriteLine();
+
+            Console.WriteLine("Reading...");
+
+            string output = llvm_process.StandardOutput.ReadLine();
+            frame.name = output;
+
+            Console.WriteLine("{0} Before Wait -> Exited", output);
+
+            // Read the blank line
+            llvm_process.StandardOutput.ReadLine();
+        }
+
+        public void Enrich(MonoStateManagedFrame frame)
         {
             var method_idx = new Tuple<string, uint>(frame.mvid, frame.token);
             if (!Lookup.ContainsKey(method_idx))
@@ -127,11 +209,12 @@ namespace DumpSymbolicate
             var seqs = Lookup [method_idx];
 
             uint goal = frame.offset;
+
             foreach (var seq in seqs)
             {
                 if (goal != seq.Offset)
                     continue;
-                
+
                 frame.start_line = seq.StartLine;
                 frame.start_col = seq.StartColumn;
                 frame.end_line = seq.EndLine;
@@ -152,25 +235,27 @@ namespace DumpSymbolicate
     {
         public readonly MonoStateThread[] Threads;
 
-        public static MonoStateManagedFrame []
+        public static MonoStateFrame []
         ParseFrames (JArray frames)
         {
-            var output = new MonoStateManagedFrame[frames.Count];
+            var output = new MonoStateFrame[frames.Count];
             for (int i = 0; i < frames.Count; i++)
             {
                 var frame = ((JObject) frames[i]);
                 //Console.WriteLine (frame.ToString ());
 
-                output [i] = new MonoStateManagedFrame ();
-
-                if (!frame.ContainsKey("is_managed") || (string) (frame ["is_managed"]) != "true")
-                    continue;
-
-                output[i].mvid = (string) frame ["guid"];
-                output[i].token = Convert.ToUInt32 ((string) frame ["token"], 16);
-                output[i].offset = Convert.ToUInt32 ((string) frame ["il_offset"], 16);
-
-                //Console.WriteLine("Parsed {0} {1:X} {2:X}", output [i].mvid, output[i].token, output[i].offset);
+                if (!frame.ContainsKey("is_managed") || (string)(frame["is_managed"]) != "true") {
+                    var added = new MonoStateUnmanagedFrame();
+                    added.address = (string)frame["native_address"];
+                    Console.WriteLine ("Native address: {0}", added.address);
+                    output [i] = added;
+                } else {
+                    var added = new MonoStateManagedFrame();
+                    added.mvid = (string) frame ["guid"];
+                    added.token = Convert.ToUInt32 ((string) frame ["token"], 16);
+                    added.offset = Convert.ToUInt32 ((string) frame ["il_offset"], 16);
+                    output[i] = added;
+                }
             }
             return output;
         }
@@ -180,6 +265,8 @@ namespace DumpSymbolicate
             var version = payload["protocol_version"];
             var crash_threads = (JArray)payload["threads"];
 
+            Console.WriteLine("There were {0} threads", crash_threads.Count);
+
             Threads = new MonoStateThread [crash_threads.Count];
 
             for (int i = 0; i < this.Threads.Length; i++)
@@ -188,9 +275,11 @@ namespace DumpSymbolicate
                 if (!thread.ContainsKey("managed_frames"))
                     continue;
 
-                var frames = SymbolicationRequest.ParseFrames((JArray) thread ["managed_frames"]);
+                var managed_frames = SymbolicationRequest.ParseFrames((JArray) thread ["managed_frames"]);
+                var unmanaged_frames = SymbolicationRequest.ParseFrames((JArray)thread["unmanaged_frames"]);
+
                 var name = "";
-                Threads[i] = new MonoStateThread(frames, name);
+                Threads[i] = new MonoStateThread(managed_frames, unmanaged_frames, name);
             }
         }
 
@@ -201,14 +290,19 @@ namespace DumpSymbolicate
                 if (thread == null)
                     continue;
                 
-                foreach (var frame in thread.Frames)
-                {
-                    if (frame.mvid != null)
-                    {
-                        code.Enrich(frame);
-                    }
-                }
+                foreach (var frame in thread.ManagedFrames)
+                    ProcessOne (code, frame);
+                foreach (var frame in thread.NativeFrames)
+                    ProcessOne(code, frame);
             }
+        }
+
+        public void ProcessOne (CodeCollection code, MonoStateFrame frame)
+        {
+            if (frame is MonoStateManagedFrame)
+                code.Enrich(frame as MonoStateManagedFrame);
+            else if (frame is MonoStateUnmanagedFrame)
+                code.Enrich(frame as MonoStateUnmanagedFrame);
         }
 
         public string Emit()
@@ -238,15 +332,6 @@ namespace DumpSymbolicate
 
     class Symbolicator
     {
-        Dictionary<string, Assembly> guid_lookup;
-
-        public void LoadAssembly(Assembly curAssembly)
-        {
-            var attribute = (GuidAttribute)curAssembly.GetCustomAttributes(typeof(GuidAttribute), true)[0];
-            var guid = attribute.Value;
-            this.guid_lookup[guid] = curAssembly;
-        }
-
         public static string FormatFrame(MonoStateFrame frame)
         {
             //Console.WriteLine ("Frame: {0}", frame.);
@@ -256,7 +341,6 @@ namespace DumpSymbolicate
 
         public Symbolicator()
         {
-            this.guid_lookup = new Dictionary<string, Assembly>();
         }
 
         // Here is where we put any workarounds for file format issues
@@ -293,17 +377,25 @@ namespace DumpSymbolicate
             if (!File.Exists(args[0]))
                 throw new Exception(String.Format("Symbolcation file not found {0}", args[0]));
 
-            if (args.Length < 2)
-                throw new Exception("Symbolcation folder not provided");
-            
             var crashFile = Symbolicator.TryReadJson(args[0]);
-
             var request = new SymbolicationRequest(crashFile);
 
-            var inputFolder = args[1];
-            string[] assemblies = Directory.GetFiles(inputFolder);
+            if (args.Length < 2)
+                throw new Exception("Symbolcation folder not provided");
 
-            var mapping = new CodeCollection ();
+            var inputFolder = args[1];
+
+            if (args.Length < 3)
+                throw new Exception("Unmanaged mono not given");
+
+            var unmanaged_mono = args [2];
+
+
+            // Only load assemblies for which we have debug info
+            string[] assemblies = Directory.GetFiles(inputFolder);
+            Console.WriteLine ("Traversing {0} assemblies", assemblies.Length);
+
+            var mapping = new CodeCollection (unmanaged_mono);
 
             // AppDomain safe_domain = AppDomain.CreateDomain("SafeDomain");
             foreach (string assembly in assemblies)
@@ -314,16 +406,16 @@ namespace DumpSymbolicate
                     var readerParameters = new ReaderParameters { ReadSymbols = true };
                     AssemblyDefinition myLibrary = null;
                     try {
-                         myLibrary = AssemblyDefinition.ReadAssembly (assembly, readerParameters);
+                        myLibrary = AssemblyDefinition.ReadAssembly (assembly, readerParameters);
                     } catch (Exception e) {
-                        // Console.WriteLine("Error parsing assembly {1}: {0}", e.Message, assembly);
+                        Console.WriteLine("Error parsing assembly {1}: {0}", e.Message, assembly);
                         continue;
                     }
 
-                    string mvid = myLibrary.MainModule.Mvid.ToString ();
+                    string mvid = myLibrary.MainModule.Mvid.ToString ().ToUpper ();
 
-                    // Console.WriteLine("{0} {1}", assembly, mvid);
-                    // Console.WriteLine("Read {0}", assembly);
+                    Console.WriteLine("{0} {1}", assembly, mvid);
+                    Console.WriteLine("Read {0}", assembly);
 
                     foreach (var ty in myLibrary.MainModule.Types){
                         for (int i = 0; i < ty.Methods.Count; i++)
@@ -339,6 +431,7 @@ namespace DumpSymbolicate
 
             request.Process(mapping);
             var result = request.Emit();
+            mapping.Shutdown ();
 
             Console.WriteLine(result);
 
