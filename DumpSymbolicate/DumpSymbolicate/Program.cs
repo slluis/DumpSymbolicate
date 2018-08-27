@@ -220,6 +220,7 @@ namespace DumpSymbolicate
                 frame.end_line = seq.EndLine;
                 frame.end_col = seq.EndColumn;
                 frame.file = seq.Document.Url;
+                break;
             }
 
             var typ = Types[method_idx];
@@ -238,6 +239,9 @@ namespace DumpSymbolicate
         public static MonoStateFrame []
         ParseFrames (JArray frames)
         {
+            if (frames == null)
+                return Array.Empty<MonoStateFrame> ();
+
             var output = new MonoStateFrame[frames.Count];
             for (int i = 0; i < frames.Count; i++)
             {
@@ -272,8 +276,6 @@ namespace DumpSymbolicate
             for (int i = 0; i < this.Threads.Length; i++)
             {
                 var thread = ((JObject) crash_threads [i]);
-                if (!thread.ContainsKey("managed_frames"))
-                    continue;
 
                 var managed_frames = SymbolicationRequest.ParseFrames((JArray) thread ["managed_frames"]);
                 var unmanaged_frames = SymbolicationRequest.ParseFrames((JArray)thread["unmanaged_frames"]);
