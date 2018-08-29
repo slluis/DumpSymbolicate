@@ -157,7 +157,7 @@ namespace DumpSymbolicate
             llvm_process = new Process();
             llvm_process.StartInfo = new ProcessStartInfo
             {
-                FileName = "llvm-symbolizer",
+                FileName = "/usr/local/opt/llvm/bin/llvm-symbolizer",
                 Arguments = String.Format("-obj={0} -pretty-print", Runtime),
                 UseShellExecute = false,
                 RedirectStandardInput = true,
@@ -371,6 +371,17 @@ namespace DumpSymbolicate
             return crashFile;
         }
 
+        static List<string> FindAssemblies (string vsPath, string monoPath)
+        {
+            var files = new List<string>();
+            files.AddRange (Directory.GetFiles(vsPath, "*.dll", SearchOption.AllDirectories));
+            files.AddRange(Directory.GetFiles(vsPath, "*.exe", SearchOption.AllDirectories));
+            files.AddRange(Directory.GetFiles(monoPath, "*.exe", SearchOption.AllDirectories));
+            files.AddRange(Directory.GetFiles(monoPath, "*.dll", SearchOption.AllDirectories));
+            files.AddRange(Directory.GetFiles("/Users/lluis/Library/Application Support/VisualStudio/7.0/LocalInstall/Addins", "*.dll", SearchOption.AllDirectories));
+            return files;
+        }
+
         public static void Main(string[] args)
         {
             if (args.Length < 1)
@@ -385,50 +396,53 @@ namespace DumpSymbolicate
             if (args.Length < 2)
                 throw new Exception("Symbolcation folder not provided");
 
-            var inputFolder = args[1];
+            var vsFolder = args[1];
 
             if (args.Length < 3)
                 throw new Exception("Unmanaged mono not given");
 
-            var unmanaged_mono = args [2];
-
+            var monoPrefix = args [2];
+            var monoPath = Path.Combine(monoPrefix, "bin", "mono");
 
             // Only load assemblies for which we have debug info
-            string[] assemblies = Directory.GetFiles(inputFolder);
-            Console.WriteLine ("Traversing {0} assemblies", assemblies.Length);
+            var assemblies = FindAssemblies(vsFolder, monoPrefix);
+            Console.WriteLine ("Traversing {0} assemblies", assemblies.Count);
 
-            var mapping = new CodeCollection (unmanaged_mono);
+            var mapping = new CodeCollection (monoPath);
+
+            var readerParameters = new ReaderParameters { ReadSymbols = true };
+            var readerParametersNoSymbols = new ReaderParameters { ReadSymbols = false };
 
             // AppDomain safe_domain = AppDomain.CreateDomain("SafeDomain");
             foreach (string assembly in assemblies)
             {
-                if (assembly.EndsWith(".dll") || assembly.EndsWith(".exe")) 
+                AssemblyDefinition myLibrary = null;
+                try
                 {
-                    // Console.WriteLine("Reading {0}", assembly);
-                    var readerParameters = new ReaderParameters { ReadSymbols = true };
-                    AssemblyDefinition myLibrary = null;
-                    try {
-                        myLibrary = AssemblyDefinition.ReadAssembly (assembly, readerParameters);
-                    } catch (Exception e) {
-                        Console.WriteLine("Error parsing assembly {1}: {0}", e.Message, assembly);
-                        continue;
-                    }
+                    var readerParams = File.Exists(Path.ChangeExtension(assembly, ".pdb")) ? readerParameters : readerParametersNoSymbols;
+                    myLibrary = AssemblyDefinition.ReadAssembly(assembly, readerParams);
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine("Error parsing assembly {1}: {0}", e.Message, assembly);
+                    continue;
+                }
 
-                    string mvid = myLibrary.MainModule.Mvid.ToString ().ToUpper ();
+                string mvid = myLibrary.MainModule.Mvid.ToString ().ToUpper ();
 
-                    Console.WriteLine("{0} {1}", assembly, mvid);
-                    Console.WriteLine("Read {0}", assembly);
+                Console.WriteLine("{0} {1}", assembly, mvid);
+                Console.WriteLine("Read {0}", assembly);
 
-                    foreach (var ty in myLibrary.MainModule.Types){
-                        for (int i = 0; i < ty.Methods.Count; i++)
-                        {
-                            string klass = ty.FullName;
-                            string function = ty.Methods[i].FullName;
-                            uint token = Convert.ToUInt32 (ty.Methods[i].MetadataToken.ToInt32());
-                            mapping.Add (assembly, klass, function, mvid, token, ty.Methods [i].DebugInformation.SequencePoints);
-                        }
+                foreach (var ty in myLibrary.MainModule.Types){
+                    for (int i = 0; i < ty.Methods.Count; i++)
+                    {
+                        string klass = ty.FullName;
+                        string function = ty.Methods[i].FullName;
+                        uint token = Convert.ToUInt32 (ty.Methods[i].MetadataToken.ToInt32());
+                        mapping.Add (assembly, klass, function, mvid, token, ty.Methods [i].DebugInformation.SequencePoints);
                     }
                 }
+                myLibrary.Dispose();
             }
 
             request.Process(mapping);
