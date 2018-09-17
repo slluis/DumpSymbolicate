@@ -307,12 +307,11 @@ namespace DumpSymbolicate
                 code.Enrich(frame as MonoStateUnmanagedFrame);
         }
 
-        public string Emit()
+        public void Emit(string filename)
         {
-            StringBuilder sb = new StringBuilder();
-            StringWriter sw = new StringWriter(sb);
+            var streamWriter = new StreamWriter (filename);
 
-            using (JsonWriter writer = new JsonTextWriter(sw))
+            using (JsonWriter writer = new JsonTextWriter(streamWriter))
             {
                 writer.Formatting = Formatting.Indented;
 
@@ -327,8 +326,6 @@ namespace DumpSymbolicate
                 writer.WriteEnd();
                 writer.WriteEndObject();
             }
-
-            return sb.ToString();
         }
     }
 
@@ -436,6 +433,13 @@ namespace DumpSymbolicate
             var monoPrefix = args [2];
             var monoPath = Path.Combine(monoPrefix, "bin", "mono");
 
+            string outputFile = "CrashReportSymbolicated.json";
+            if (args.Length == 4) {
+                outputFile = args[3];
+            }
+
+            Console.WriteLine ("Finding assemblies");
+
             // Only load assemblies for which we have debug info
             stopwatch.Restart ();
             var assemblies = FindAssemblies(vsFolder, monoPrefix);
@@ -484,7 +488,9 @@ namespace DumpSymbolicate
 
             stopwatch.Restart ();
             request.Process(mapping);
-            var result = request.Emit();
+            symbolicate = stopwatch.ElapsedMilliseconds;
+
+            request.Emit(outputFile);
             mapping.Shutdown ();
 
             stopwatch.Stop ();
