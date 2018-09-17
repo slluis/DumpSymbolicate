@@ -334,6 +334,13 @@ namespace DumpSymbolicate
 
     class Symbolicator
     {
+        static Stopwatch stopwatch = new Stopwatch ();
+        static long readingJson;
+        static long createRequest;
+        static long findAssemblies;
+        static long readingAssemblies;
+        static long symbolicate;
+
         public static string FormatFrame(MonoStateFrame frame)
         {
             //Console.WriteLine ("Frame: {0}", frame.);
@@ -371,14 +378,32 @@ namespace DumpSymbolicate
             return crashFile;
         }
 
+        static List<string> GetAllAssemblies (string path)
+        {
+            var assemblies = new List<string> ();
+
+            foreach (var s in Directory.EnumerateFiles (path, "*", SearchOption.AllDirectories)) {
+                if (s.EndsWith (".exe", StringComparison.Ordinal) || s.EndsWith (".dll", StringComparison.Ordinal)) {
+                    assemblies.Add (s);
+                }
+            }
+
+            return assemblies;
+        }
+
         static List<string> FindAssemblies (string vsPath, string monoPath)
         {
             var files = new List<string>();
-            files.AddRange (Directory.GetFiles(vsPath, "*.dll", SearchOption.AllDirectories));
-            files.AddRange(Directory.GetFiles(vsPath, "*.exe", SearchOption.AllDirectories));
-            files.AddRange(Directory.GetFiles(monoPath, "*.exe", SearchOption.AllDirectories));
-            files.AddRange(Directory.GetFiles(monoPath, "*.dll", SearchOption.AllDirectories));
-            files.AddRange(Directory.GetFiles("/Users/lluis/Library/Application Support/VisualStudio/7.0/LocalInstall/Addins", "*.dll", SearchOption.AllDirectories));
+           
+            files.AddRange (GetAllAssemblies (vsPath));
+            files.AddRange (GetAllAssemblies (monoPath));
+
+            var home = Environment.GetFolderPath (Environment.SpecialFolder.Personal);
+            var addin = Path.Combine (home, "Library/Application Support/VisualStudio/7.0/LocalInstall/Addins");
+            if (Directory.Exists (addin)) {
+                files.AddRange(Directory.GetFiles(addin, "*.dll", SearchOption.AllDirectories));
+            }
+
             return files;
         }
 
@@ -390,8 +415,15 @@ namespace DumpSymbolicate
             if (!File.Exists(args[0]))
                 throw new Exception(String.Format("Symbolcation file not found {0}", args[0]));
 
+            Console.WriteLine ("Reading crash JSON");
+            stopwatch.Start();
             var crashFile = Symbolicator.TryReadJson(args[0]);
+            readingJson = stopwatch.ElapsedMilliseconds;
+
+            Console.WriteLine ("Creating request");
+            stopwatch.Restart ();
             var request = new SymbolicationRequest(crashFile);
+            createRequest = stopwatch.ElapsedMilliseconds;
 
             if (args.Length < 2)
                 throw new Exception("Symbolcation folder not provided");
@@ -405,7 +437,10 @@ namespace DumpSymbolicate
             var monoPath = Path.Combine(monoPrefix, "bin", "mono");
 
             // Only load assemblies for which we have debug info
+            stopwatch.Restart ();
             var assemblies = FindAssemblies(vsFolder, monoPrefix);
+            findAssemblies = stopwatch.ElapsedMilliseconds;
+
             Console.WriteLine ("Traversing {0} assemblies", assemblies.Count);
 
             var mapping = new CodeCollection (monoPath);
@@ -414,6 +449,7 @@ namespace DumpSymbolicate
             var readerParametersNoSymbols = new ReaderParameters { ReadSymbols = false };
 
             // AppDomain safe_domain = AppDomain.CreateDomain("SafeDomain");
+            stopwatch.Restart ();
             foreach (string assembly in assemblies)
             {
                 AssemblyDefinition myLibrary = null;
@@ -444,12 +480,21 @@ namespace DumpSymbolicate
                 }
                 myLibrary.Dispose();
             }
+            readingAssemblies = stopwatch.ElapsedMilliseconds;
 
+            stopwatch.Restart ();
             request.Process(mapping);
             var result = request.Emit();
             mapping.Shutdown ();
 
-            Console.WriteLine(result);
+            stopwatch.Stop ();
+
+            Console.WriteLine ("Timings\n-------");
+            Console.WriteLine ($"   Reading crash log: {readingJson}ms");
+            Console.WriteLine ($"   Creating request: {createRequest}ms");
+            Console.WriteLine ($"   Finding assemblies: {findAssemblies}ms");
+            Console.WriteLine ($"   Reading assemblies: {readingAssemblies}ms");
+            Console.WriteLine ($"   Symbolification: {symbolicate}ms");
 
             //var MonoState = new MonoStateParser (argv [1]);
             //foreach (var thread in MonoState.Threads)
