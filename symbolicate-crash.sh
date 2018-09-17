@@ -104,9 +104,7 @@ gather_assemblies () {
 
 symbolicate_crash () {
     echo "Symbolicating CrashReport"
-    mono DumpSymbolicate/DumpSymbolicate/bin/Debug/DumpSymbolicate.exe $rootDirectory/CrashReport.txt vsmac_mount mono-tmp
-
-    cp CrashReportSymbolicated.json $rootDirectory/CrashReportSymbolicated.json
+    mono DumpSymbolicate/DumpSymbolicate/bin/Debug/DumpSymbolicate.exe --crashFile=$rootDirectory/CrashReport.txt --vsmacPath=vsmac_mount/Visual\ Studio/Visual\ Studio.app --monoPath=mono-tmp --outputFile=$rootDirectory/CrashReportSymbolicated.json
 }
 
 vsmVersion=$(get_version "Parameter1>")

@@ -16,6 +16,8 @@ using System.Text.RegularExpressions;
 
 using System.Diagnostics;
 
+using Mono.Options;
+
 namespace DumpSymbolicate
 {
 
@@ -406,15 +408,58 @@ namespace DumpSymbolicate
 
         public static void Main(string[] args)
         {
-            if (args.Length < 1)
-                throw new Exception("Symbolcation file not provided");
+            var outputFile = "CrashReportSymbolicated.json";
+            string vsFolder = null;
+            string monoPrefix = null;
+            string crashPath = null;
+            bool shouldShowHelp = false;
 
-            if (!File.Exists(args[0]))
-                throw new Exception(String.Format("Symbolcation file not found {0}", args[0]));
+            var options = new OptionSet {
+                { "crashFile=", "The path to CrashReport.txt", n => crashPath = n },
+                { "outputFile=", "The filename of the symbolicated crash report", n => outputFile = n },
+                { "vsmacPath=", "The path to the VSMac folder", n => vsFolder = n },
+                { "monoPath=", "The path to the Mono folder", n => monoPrefix = n },
+                { "help", "Print help", n => shouldShowHelp = n != null }
+            };
+
+            List<string> extra;
+            try
+            {
+                extra = options.Parse (args);
+            }
+            catch (OptionException e)
+            {
+                Console.Write("DumpSymbolicate.exe: ");
+                Console.WriteLine(e.Message);
+                Console.WriteLine("Try `DumpSymbolicate.exe --help' for more information.");
+                return;
+            }
+
+            if (shouldShowHelp) {
+                ShowHelp (options);
+                return;
+            }
+
+            if (string.IsNullOrEmpty (crashPath)) {
+                throw new OptionException ("Crash file not provided", "crashFile");
+            }
+
+            if (!File.Exists(crashPath)) {
+                throw new FileNotFoundException ($"Symbolication file not found: {crashPath}");
+            }
+
+            if (string.IsNullOrEmpty (vsFolder)) {
+                throw new OptionException ("VSMac path not provided", "vsmacPath");
+            }
+
+            if (string.IsNullOrEmpty (monoPrefix)) {
+                throw new OptionException ("Mono path not provided", "monoPath");
+            }
 
             Console.WriteLine ("Reading crash JSON");
             stopwatch.Start();
-            var crashFile = Symbolicator.TryReadJson(args[0]);
+
+            var crashFile = Symbolicator.TryReadJson(crashPath);
             readingJson = stopwatch.ElapsedMilliseconds;
 
             Console.WriteLine ("Creating request");
@@ -422,21 +467,7 @@ namespace DumpSymbolicate
             var request = new SymbolicationRequest(crashFile);
             createRequest = stopwatch.ElapsedMilliseconds;
 
-            if (args.Length < 2)
-                throw new Exception("Symbolcation folder not provided");
-
-            var vsFolder = args[1];
-
-            if (args.Length < 3)
-                throw new Exception("Unmanaged mono not given");
-
-            var monoPrefix = args [2];
             var monoPath = Path.Combine(monoPrefix, "bin", "mono");
-
-            string outputFile = "CrashReportSymbolicated.json";
-            if (args.Length == 4) {
-                outputFile = args[3];
-            }
 
             Console.WriteLine ("Finding assemblies");
 
@@ -508,6 +539,15 @@ namespace DumpSymbolicate
             //FormatFrame (frame);
 
             // AppDomain.Unload(safe_domain);
+        }
+
+        static void ShowHelp (OptionSet options)
+        {
+            Console.WriteLine("Usage: DumpSymbolicate.exe [OPTIONS]");
+            Console.WriteLine("Symbolicate a VSMac crash report");
+            Console.WriteLine();
+            Console.WriteLine("Options:");
+            options.WriteOptionDescriptions(Console.Out);
         }
     }
 }
