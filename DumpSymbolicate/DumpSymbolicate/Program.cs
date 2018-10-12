@@ -165,6 +165,11 @@ namespace DumpSymbolicate
 
         public void Enrich(MonoStateUnmanagedFrame frame)
         {
+            if (string.IsNullOrEmpty (MonoExePath))
+            {
+                return;
+            }
+
             if (frame.address == "outside mono-sgen")
                 return;
 
@@ -250,8 +255,6 @@ namespace DumpSymbolicate
         [JsonProperty]
         Dictionary<Key, MethodType> Types { get; set; }
 
-        public readonly string Runtime;
-
         Dictionary<string, HashSet<uint>> mvids = new Dictionary<string, HashSet<uint>>();
 
         public void Add (string assembly, string klass, string function, string mvid, uint token, Collection<SequencePoint> seqs)
@@ -284,11 +287,10 @@ namespace DumpSymbolicate
             };
         }
 
-        public CodeCollection (string unmanaged_mono)
+        public CodeCollection ()
         {
             Lookup = new Dictionary<Key, List<Sequence>>();
             Types = new Dictionary<Key, MethodType>();
-            Runtime = unmanaged_mono;
         }
 
         public bool TryEnrich(MonoStateManagedFrame frame)
@@ -340,6 +342,23 @@ namespace DumpSymbolicate
                     {
                         var serializer = new JsonSerializer();
                         serializer.Serialize(streamWriter, this);
+                    }
+                }
+            }
+        }
+
+        public static CodeCollection Deserialize (string filename)
+        {
+            using (var stream = File.OpenRead (filename))
+            {
+                using (var decompressedStream = new GZipStream (stream, CompressionMode.Decompress))
+                {
+                    using (var streamReader = new StreamReader(decompressedStream))
+                    {
+                        var serializer = new JsonSerializer();
+
+                        var reader = new JsonTextReader(streamReader);
+                        return serializer.Deserialize<CodeCollection>(reader);
                     }
                 }
             }
@@ -539,19 +558,34 @@ namespace DumpSymbolicate
 
         static CodeCollection CreateMappingForPath (string path, string monoPath)
         {
-            var mapping = new CodeCollection(monoPath);
+            var mapping = new CodeCollection();
 
             GetAllAssemblies(path, mapping);
 
             return mapping;
         }
 
-        static List<CodeCollection> FindAssemblies (string vsPath, string monoPath, string monoExePath)
+        static List<CodeCollection> FindAssemblies (string vsPath, string monoPath, string monoExePath, string vsIndex, string monoIndex)
         {
             var maps = new List<CodeCollection>();
 
-            maps.Add(CreateMappingForPath(vsPath, monoExePath));
-            maps.Add(CreateMappingForPath(monoPath, monoExePath));
+            if (string.IsNullOrEmpty(vsIndex))
+            {
+                maps.Add(CreateMappingForPath(vsPath, monoExePath));
+            }
+            else
+            {
+                maps.Add(CodeCollection.Deserialize (vsIndex));
+            }
+
+            if (string.IsNullOrEmpty(monoIndex))
+            {
+                maps.Add(CreateMappingForPath(monoPath, monoExePath));
+            }
+            else
+            {
+                maps.Add(CodeCollection.Deserialize (monoIndex));
+            }
 
             var home = Environment.GetFolderPath (Environment.SpecialFolder.Personal);
             var addin = Path.Combine (home, "Library/Application Support/VisualStudio/7.0/LocalInstall/Addins");
@@ -566,7 +600,9 @@ namespace DumpSymbolicate
         {
             var outputFile = "CrashReportSymbolicated.json";
             string vsFolder = null;
+            string vsIndex = null;
             string monoPrefix = null;
+            string monoIndex = null;
             string crashPath = null;
             string indexFile = null;
             bool shouldShowHelp = false;
@@ -575,7 +611,9 @@ namespace DumpSymbolicate
                 { "crashFile=", "The path to CrashReport.txt", n => crashPath = n },
                 { "outputFile=", "The filename of the symbolicated crash report", n => outputFile = n },
                 { "vsmacPath=", "The path to the VSMac folder", n => vsFolder = n },
+                { "vsmacIndex=", "The path to the VSMac symbol index file", n => vsIndex = n },
                 { "monoPath=", "The path to the Mono folder", n => monoPrefix = n },
+                { "monoIndex=", "The path to the Mono symbol index file", n => monoIndex = n },
                 { "generateIndexFile=", "The filename of the index file", n => indexFile = n},
                 { "help", "Print help", n => shouldShowHelp = n != null }
             };
@@ -628,7 +666,7 @@ namespace DumpSymbolicate
 
             // Only load assemblies for which we have debug info
             stopwatch.Restart ();
-            var maps = FindAssemblies(vsFolder, monoPrefix, monoPath);
+            var maps = FindAssemblies(vsFolder, monoPrefix, monoPath, vsIndex, monoIndex);
             var processAssemblies = stopwatch.ElapsedMilliseconds;
 
             stopwatch.Restart();
