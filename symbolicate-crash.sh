@@ -6,6 +6,23 @@ else
     rootDirectory=$1
 fi
 
+if [ -z "$2" ]; then
+    needVSMac=true
+    vsmacPath=vsmac.dmg
+else
+    needVSMac=false
+    vsmacPath=$2
+fi
+
+if [ -z "$3" ]; then
+    needMono=true
+    monoPath=mono.pkg
+else
+    needMono=false
+    monoPath=$3
+fi
+
+
 if [ "$rootDirectory" = "--help" ]; then
     echo "symbolicate-crash.sh [path folder containing crash logs (blank for current folder)]"
     exit 0
@@ -53,7 +70,7 @@ EOF
 mount_vsmac_image () {
     echo "Mounting VSMac image"
     mkdir vsmac_mount
-    VSMAC_DISK=$(hdiutil attach -mountroot vsmac_mount vsmac.dmg | tail -1 | cut -f 1)
+    VSMAC_DISK=$(hdiutil attach -mountroot vsmac_mount $vsmacPath | tail -1 | cut -f 1)
     echo "VSMac drive: $VSMAC_DISK"
 }
 
@@ -68,7 +85,7 @@ extract_mono_binary () {
     pushd .
 
     cd mono-tmp
-    xar -xf ../mono.pkg
+    xar -xf ../$monoPath
 
     cd mono.pkg
 
@@ -104,7 +121,10 @@ gather_assemblies () {
 
 symbolicate_crash () {
     echo "Symbolicating CrashReport"
-    mono DumpSymbolicate/DumpSymbolicate/bin/Debug/DumpSymbolicate.exe --crashFile=$rootDirectory/CrashReport.txt --vsmacPath=vsmac_mount/Visual\ Studio/Visual\ Studio.app --monoPath=mono-tmp --outputFile=$rootDirectory/CrashReportSymbolicated.json
+    mono DumpSymbolicate/DumpSymbolicate/bin/Debug/DumpSymbolicate.exe --crashFile=$rootDirectory/CrashReport.txt --vsmacPath=vsmac_mount/Visual\ Studio/Visual\ Studio.app --monoPath=mono-tmp --outputFile=$rootDirectory/CrashReportSymbolicated.json --generateIndexFile=$rootDirectory/generatedSymbols
+
+    mv $rootDirectory/generatedSymbols-vsmac.json.gz $rootDirectory/generatedSymbols-vsmac-$vsmVersion.json.gz
+    mv $rootDirectory/generatedSymbols-mono.json.gz $rootDirectory/generatedSymbols-mono-$monoVersion.json.gz
 }
 
 vsmVersion=$(get_version "Parameter1>")
@@ -119,11 +139,15 @@ X=$(curl -i -X POST --data "$(generate_version_json $vsmVersion $monoVersion)" "
 urls=($(grep -o "url=\"[^\"]*" <<< "$X" | sed -n -e 's/url=\"\([^\"]\)/\1/p'))
 
 # Download
-echo "Downloading VSMac: ${urls[0]} "
-curl -L -o vsmac.dmg ${urls[0]}
+if [ "$needVSMac" = true ]; then
+    echo "Downloading VSMac: ${urls[0]} "
+    curl -L -o vsmac.dmg ${urls[0]}
+fi
 
-echo "Downloading Mono: ${urls[1]} "
-curl -L -o mono.pkg ${urls[1]}
+if [ "$needMono" = true ]; then
+    echo "Downloading Mono: ${urls[1]} "
+    curl -L -o mono.pkg ${urls[1]}
+fi
 
 mount_vsmac_image
 
@@ -135,5 +159,11 @@ symbolicate_crash
 
 echo "Cleaning up"
 unmount_vsmac_image
-rm -f mono.pkg vsmac.dmg mono-sgen64
+if [ $"needVSMac" = true ]; then
+    rm -f vsmac.dmg
+fi
+
+if [ $"needMono" = true ]; then
+    rm -f mono.pkg mono-sgen64
+fi
 rm -rf mono-tmp
