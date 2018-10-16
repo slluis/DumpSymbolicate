@@ -121,7 +121,21 @@ gather_assemblies () {
 
 symbolicate_crash () {
     echo "Symbolicating CrashReport"
-    mono DumpSymbolicate/DumpSymbolicate/bin/Debug/DumpSymbolicate.exe --crashFile=$rootDirectory/CrashReport.txt --vsmacPath=vsmac_mount/Visual\ Studio/Visual\ Studio.app --monoPath=mono-tmp --outputFile=$rootDirectory/CrashReportSymbolicated.json --generateIndexFile=$rootDirectory/generatedSymbols
+    mono DumpSymbolicate/DumpSymbolicate/bin/Debug/DumpSymbolicate.exe --crashFile=$rootDirectory/CrashReport.txt --outputFile=$rootDirectory/CrashReportSymbolicated.json --monoIndex=$rootDirectory/generatedSymbols-mono-$monoVersion.json.gz --vsmacIndex=$rootDirectory/generatedSymbols-vsmac-$vsmVersion.json.gz --monoNativeIndex=$rootDirectory/native-symbols.dump
+}
+
+generate_native_index () {
+    echo "Generating Native Index"
+
+    rm -f $rootDirectory/native-symbols.dump
+    ./create-native-index.sh mono-tmp/ $rootDirectory/native-symbols.dump
+    ./create-native-index.sh vsmac_mount/Visual\ Studio/Visual\ Studio.app/ $rootDirectory/native-symbols.dump
+}
+
+generate_managed_index () {
+    echo "Generating Managed Index"
+
+    mono DumpSymbolicate/DumpSymbolicate/bin/Debug/DumpSymbolicate.exe --vsmacPath=vsmac_mount/Visual\ Studio/Visual\ Studio.app --monoPath=mono-tmp --generateIndexFile=$rootDirectory/generatedSymbols
 
     mv $rootDirectory/generatedSymbols-vsmac.json.gz $rootDirectory/generatedSymbols-vsmac-$vsmVersion.json.gz
     mv $rootDirectory/generatedSymbols-mono.json.gz $rootDirectory/generatedSymbols-mono-$monoVersion.json.gz
@@ -153,6 +167,8 @@ mount_vsmac_image
 
 extract_mono_binary
 
+generate_native_index
+generate_managed_index
 #gather_assemblies
 
 symbolicate_crash

@@ -20,13 +20,14 @@ using Mono.Options;
 using System.Security.Policy;
 using System.IO.MemoryMappedFiles;
 using System.IO.Compression;
+using System.ComponentModel;
+using System.Globalization;
 
 namespace DumpSymbolicate
 {
 
     internal class MonoStateThread
     {
-        // Only do managed frames for now
         internal MonoStateFrame[] ManagedFrames;
         internal MonoStateFrame[] NativeFrames;
 
@@ -137,9 +138,48 @@ namespace DumpSymbolicate
 
     class NativeMapper
     {
+        class NativeMethod
+        {
+            public string Name { get; set; }
+            public string FileName { get; set; }
+        }
+
+        Dictionary<string, NativeMethod> offsetToMethodName;
+
         public string MonoExePath { get; set; }
 
         Process llvm_process;
+
+        public NativeMapper (string indexFile)
+        {
+            if (string.IsNullOrEmpty (indexFile))
+            {
+                return;
+            }
+            offsetToMethodName = new Dictionary<string, NativeMethod>();
+
+            using (var stream = File.OpenRead (indexFile))
+            {
+                using (var reader = new StreamReader (stream))
+                {
+                    string line;
+                    string currentFile = "Unknown";
+
+                    while ((line = reader.ReadLine ()) != null) {
+                        if (line.StartsWith ("Name: ", StringComparison.InvariantCulture))
+                        {
+                            currentFile = line.Substring(7);
+                            continue;
+                        }
+
+                        var fields = line.Split(' ');
+
+                        var nm = new NativeMethod { FileName = currentFile, Name = fields[1] };
+                        offsetToMethodName[fields[0]] = nm;
+                    }
+                }
+            }
+        }
 
         public void InitLLvmSymbolizer()
         {
@@ -163,8 +203,29 @@ namespace DumpSymbolicate
             }
         }
 
+        bool EnrichFromIndex (MonoStateUnmanagedFrame frame)
+        {
+            if (offsetToMethodName == null)
+            {
+                return false;
+            }
+
+            if (offsetToMethodName.TryGetValue (frame.address, out var nativeMethod))
+            {
+                frame.name = $"{nativeMethod.Name} - {nativeMethod.FileName}";
+                return true;
+            }
+
+            return false;
+        }
+
         public void Enrich(MonoStateUnmanagedFrame frame)
         {
+            if (EnrichFromIndex (frame))
+            {
+                return;
+            }
+
             if (string.IsNullOrEmpty (MonoExePath))
             {
                 return;
@@ -190,10 +251,61 @@ namespace DumpSymbolicate
     [JsonObject(MemberSerialization.OptIn)]
     class CodeCollection 
     {
+        class KeyConverter : TypeConverter
+        {
+            public override bool CanConvertFrom(ITypeDescriptorContext context, Type sourceType)
+            {
+                if (sourceType == typeof (string))
+                {
+                    return true;
+                }
+                return base.CanConvertFrom(context, sourceType);
+            }
+
+            public override object ConvertFrom(ITypeDescriptorContext context, CultureInfo culture, object value)
+            {
+                if (value is string v)
+                {
+                    return new Key(v);
+                }
+                return base.ConvertFrom(context, culture, value);
+            }
+
+            public override object ConvertTo(ITypeDescriptorContext context, CultureInfo culture, object value, Type destinationType)
+            {
+                if (destinationType == typeof (string))
+                {
+                    return value.ToString();
+                }
+                return base.ConvertTo(context, culture, value, destinationType);
+            }
+        }
+
+        [TypeConverter (typeof (KeyConverter))]
         class Key : IEquatable<Key>
         {
             public string Mvid { get; set; }
             public uint Token { get; set; }
+
+            public Key ()
+            { }
+
+            public Key (string serialized)
+            {
+                var v = serialized.Split(':');
+                if (v.Length != 2)
+                {
+                    throw new Exception($"Invalid serialized format: {serialized}");
+                }
+
+                Mvid = v[0];
+                Token = Convert.ToUInt32(v[1]);
+            }
+
+            public override string ToString()
+            {
+                return $"{Mvid}:{Token}";
+            }
 
             public bool Equals (Key other)
             {
@@ -605,6 +717,7 @@ namespace DumpSymbolicate
             string monoIndex = null;
             string crashPath = null;
             string indexFile = null;
+            string nativeIndex = null;
             bool shouldShowHelp = false;
 
             var options = new OptionSet {
@@ -614,7 +727,8 @@ namespace DumpSymbolicate
                 { "vsmacIndex=", "The path to the VSMac symbol index file", n => vsIndex = n },
                 { "monoPath=", "The path to the Mono folder", n => monoPrefix = n },
                 { "monoIndex=", "The path to the Mono symbol index file", n => monoIndex = n },
-                { "generateIndexFile=", "The filename of the index file", n => indexFile = n},
+                { "generateIndexFile=", "The filename of the index file", n => indexFile = n },
+                { "monoNativeIndex=", "The managed symbol index file", n => nativeIndex = n },
                 { "help", "Print help", n => shouldShowHelp = n != null }
             };
 
@@ -636,33 +750,26 @@ namespace DumpSymbolicate
                 return;
             }
 
-            if (string.IsNullOrEmpty (crashPath)) {
-                throw new OptionException ("Crash file not provided", "crashFile");
-            }
-
-            if (!File.Exists(crashPath)) {
-                throw new FileNotFoundException ($"Symbolication file not found: {crashPath}");
-            }
-
-            if (string.IsNullOrEmpty (vsFolder)) {
-                throw new OptionException ("VSMac path not provided", "vsmacPath");
-            }
-
-            if (string.IsNullOrEmpty (monoPrefix)) {
-                throw new OptionException ("Mono path not provided", "monoPath");
-            }
-
             stopwatch.Start();
 
-            var crashFile = TryReadJson(crashPath);
-            var readingJson = stopwatch.ElapsedMilliseconds;
+            string monoPath = null;
+            if (!string.IsNullOrEmpty(monoPrefix))
+            {
+                monoPath = Path.Combine(monoPrefix, "bin", "mono");
+            }
+            var nativeMapper = new NativeMapper(nativeIndex) { MonoExePath = monoPath };
 
-            var monoPath = Path.Combine(monoPrefix, "bin", "mono");
-            var nativeMapper = new NativeMapper { MonoExePath = monoPath };
+            SymbolicationRequest request = null;
+            long readingJson = 0, createRequest = 0;
+            if (!string.IsNullOrEmpty(crashPath))
+            {
+                var crashFile = TryReadJson(crashPath);
+                readingJson = stopwatch.ElapsedMilliseconds;
 
-            stopwatch.Restart ();
-            var request = new SymbolicationRequest(crashFile, nativeMapper);
-            var createRequest = stopwatch.ElapsedMilliseconds;
+                stopwatch.Restart();
+                request = new SymbolicationRequest(crashFile, nativeMapper);
+                createRequest = stopwatch.ElapsedMilliseconds;
+            }
 
             // Only load assemblies for which we have debug info
             stopwatch.Restart ();
@@ -677,10 +784,15 @@ namespace DumpSymbolicate
             var creatingIndex = stopwatch.ElapsedMilliseconds;
 
             stopwatch.Restart ();
-            request.Process(maps);
-            var symbolicate = stopwatch.ElapsedMilliseconds;
 
-            request.Emit(outputFile);
+            long symbolicate = 0;
+            if (request != null)
+            {
+                request.Process(maps);
+                symbolicate = stopwatch.ElapsedMilliseconds;
+
+                request.Emit(outputFile);
+            }
 
             nativeMapper.Shutdown ();
 
