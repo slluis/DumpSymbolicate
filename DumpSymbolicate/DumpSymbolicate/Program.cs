@@ -16,12 +16,18 @@ using System.Text.RegularExpressions;
 
 using System.Diagnostics;
 
+using Mono.Options;
+using System.Security.Policy;
+using System.IO.MemoryMappedFiles;
+using System.IO.Compression;
+using System.ComponentModel;
+using System.Globalization;
+
 namespace DumpSymbolicate
 {
 
     internal class MonoStateThread
     {
-        // Only do managed frames for now
         internal MonoStateFrame[] ManagedFrames;
         internal MonoStateFrame[] NativeFrames;
 
@@ -130,35 +136,58 @@ namespace DumpSymbolicate
 
     }
 
-    class CodeCollection 
+    class NativeMapper
     {
-        Dictionary<Tuple<string, uint>, Collection<SequencePoint>> Lookup;
-        Dictionary<Tuple<string, uint>, Tuple<string, string, string>> Types;
-        public readonly string Runtime;
-
-        public void Add (string assembly, string klass, string function, string mvid, uint token, Collection<SequencePoint> seqs)
+        class NativeMethod
         {
-            var key = new Tuple<string, uint>(mvid, token);
-            Lookup[key] = seqs;
-            Types[key] = new Tuple<string, string, string>(assembly, klass, function);
+            public string Name { get; set; }
+            public string FileName { get; set; }
         }
 
-        public CodeCollection (string unmanaged_mono)
-        {
-            Lookup = new Dictionary<Tuple<string, uint>, Collection<SequencePoint>>();
-            Types = new Dictionary<Tuple<string, uint>, Tuple<string, string, string>>();
-            Runtime = unmanaged_mono;
-        }
+        Dictionary<string, NativeMethod> offsetToMethodName;
+
+        public string MonoExePath { get; set; }
 
         Process llvm_process;
 
-        public void InitLLvmSymbolizer ()
+        public NativeMapper (string indexFile)
+        {
+            if (string.IsNullOrEmpty (indexFile))
+            {
+                return;
+            }
+            offsetToMethodName = new Dictionary<string, NativeMethod>();
+
+            using (var stream = File.OpenRead (indexFile))
+            {
+                using (var reader = new StreamReader (stream))
+                {
+                    string line;
+                    string currentFile = "Unknown";
+
+                    while ((line = reader.ReadLine ()) != null) {
+                        if (line.StartsWith ("Name: ", StringComparison.InvariantCulture))
+                        {
+                            currentFile = line.Substring(7);
+                            continue;
+                        }
+
+                        var fields = line.Split(' ');
+
+                        var nm = new NativeMethod { FileName = currentFile, Name = fields[1] };
+                        offsetToMethodName[fields[0]] = nm;
+                    }
+                }
+            }
+        }
+
+        public void InitLLvmSymbolizer()
         {
             llvm_process = new Process();
             llvm_process.StartInfo = new ProcessStartInfo
             {
                 FileName = "/usr/local/opt/llvm/bin/llvm-symbolizer",
-                Arguments = String.Format("-obj={0} -pretty-print", Runtime),
+                Arguments = String.Format("-obj={0} -pretty-print", MonoExePath),
                 UseShellExecute = false,
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
@@ -166,44 +195,226 @@ namespace DumpSymbolicate
             llvm_process.Start();
         }
 
-        public void Shutdown ()
+        public void Shutdown()
         {
-            llvm_process.Kill ();
+            if (llvm_process != null)
+            {
+                llvm_process.Kill();
+            }
         }
 
-        public void Enrich (MonoStateUnmanagedFrame frame)
+        bool EnrichFromIndex (MonoStateUnmanagedFrame frame)
         {
+            if (offsetToMethodName == null)
+            {
+                return false;
+            }
+
+            if (offsetToMethodName.TryGetValue (frame.address, out var nativeMethod))
+            {
+                frame.name = $"{nativeMethod.Name} - {nativeMethod.FileName}";
+                return true;
+            }
+
+            return false;
+        }
+
+        public void Enrich(MonoStateUnmanagedFrame frame)
+        {
+            if (EnrichFromIndex (frame))
+            {
+                return;
+            }
+
+            if (string.IsNullOrEmpty (MonoExePath))
+            {
+                return;
+            }
+
             if (frame.address == "outside mono-sgen")
                 return;
-            else
-                Console.WriteLine ("Symbolicating!");
-
-            Console.WriteLine("Process started, sending {0}", frame.address);
 
             if (llvm_process == null)
-                InitLLvmSymbolizer ();
+                InitLLvmSymbolizer();
 
             llvm_process.StandardInput.WriteLine(frame.address);
             llvm_process.StandardInput.WriteLine();
 
-            Console.WriteLine("Reading...");
-
             string output = llvm_process.StandardOutput.ReadLine();
             frame.name = output;
-
-            Console.WriteLine("{0} Before Wait -> Exited", output);
 
             // Read the blank line
             llvm_process.StandardOutput.ReadLine();
         }
+    }
 
-        public void Enrich(MonoStateManagedFrame frame)
+    [JsonObject(MemberSerialization.OptIn)]
+    class CodeCollection 
+    {
+        class KeyConverter : TypeConverter
         {
-            var method_idx = new Tuple<string, uint>(frame.mvid, frame.token);
+            public override bool CanConvertFrom(ITypeDescriptorContext context, Type sourceType)
+            {
+                if (sourceType == typeof (string))
+                {
+                    return true;
+                }
+                return base.CanConvertFrom(context, sourceType);
+            }
+
+            public override object ConvertFrom(ITypeDescriptorContext context, CultureInfo culture, object value)
+            {
+                if (value is string v)
+                {
+                    return new Key(v);
+                }
+                return base.ConvertFrom(context, culture, value);
+            }
+
+            public override object ConvertTo(ITypeDescriptorContext context, CultureInfo culture, object value, Type destinationType)
+            {
+                if (destinationType == typeof (string))
+                {
+                    return value.ToString();
+                }
+                return base.ConvertTo(context, culture, value, destinationType);
+            }
+        }
+
+        [TypeConverter (typeof (KeyConverter))]
+        class Key : IEquatable<Key>
+        {
+            public string Mvid { get; set; }
+            public uint Token { get; set; }
+
+            public Key ()
+            { }
+
+            public Key (string serialized)
+            {
+                var v = serialized.Split(':');
+                if (v.Length != 2)
+                {
+                    throw new Exception($"Invalid serialized format: {serialized}");
+                }
+
+                Mvid = v[0];
+                Token = Convert.ToUInt32(v[1]);
+            }
+
+            public override string ToString()
+            {
+                return $"{Mvid}:{Token}";
+            }
+
+            public bool Equals (Key other)
+            {
+                if (other == null) { return false; }
+                return Token == other.Token && string.Equals(Mvid, other.Mvid);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked // Overflow is fine, just wrap
+                {
+                    int hash = 12277;
+
+                    hash = hash * 1372981 + Mvid.GetHashCode();
+                    hash = hash * 1372981 + Token.GetHashCode();
+                    return hash;
+                }
+            }
+
+            public override bool Equals(object obj)
+            {
+                return Equals(obj as Key);
+            }
+        }
+
+        class Sequence
+        {
+            public string Filename { get; set; }
+            public int Offset { get; set; }
+            public int StartLine { get; set; }
+            public int EndLine { get; set; }
+            public int StartColumn { get; set; }
+            public int EndColumn { get; set; }
+
+            public Sequence ()
+            {
+            }
+
+            public Sequence (SequencePoint sp)
+            {
+                Filename = sp.Document.Url;
+                Offset = sp.Offset;
+                StartLine = sp.StartLine;
+                EndLine = sp.EndLine;
+                StartColumn = sp.StartColumn;
+                EndColumn = sp.EndColumn;
+            }
+        }
+
+        class MethodType
+        {
+            public string Assembly { get; set; }
+            public string Class { get; set; }
+            public string Function { get; set; }
+        }
+
+        [JsonProperty]
+        Dictionary<Key, List<Sequence>> Lookup { get; set; }
+        [JsonProperty]
+        Dictionary<Key, MethodType> Types { get; set; }
+
+        Dictionary<string, HashSet<uint>> mvids = new Dictionary<string, HashSet<uint>>();
+
+        public void Add (string assembly, string klass, string function, string mvid, uint token, Collection<SequencePoint> seqs)
+        {
+            var key = new Key
+            {
+                Mvid = mvid,
+                Token = token
+            };
+
+            if (!mvids.TryGetValue(mvid, out HashSet<uint> tokens))
+            {
+                tokens = new HashSet<uint>();
+                mvids[mvid] = tokens;
+            }
+            tokens.Add(token);
+
+            List<Sequence> sequences = new List<Sequence>();
+            foreach (var s in seqs)
+            {
+                sequences.Add(new Sequence(s));
+            }
+
+            Lookup[key] = sequences;
+            Types[key] = new MethodType
+            {
+                Assembly = assembly,
+                Class = klass,
+                Function = function
+            };
+        }
+
+        public CodeCollection ()
+        {
+            Lookup = new Dictionary<Key, List<Sequence>>();
+            Types = new Dictionary<Key, MethodType>();
+        }
+
+        public bool TryEnrich(MonoStateManagedFrame frame)
+        {
+            var method_idx = new Key {
+                Mvid = frame.mvid,
+                Token = frame.token
+            };
+
             if (!Lookup.ContainsKey(method_idx))
             {
-                Console.WriteLine("Missing information for {0} {1}", frame.mvid, frame.token);
-                return;
+                return false;
             }
 
             var seqs = Lookup [method_idx];
@@ -219,22 +430,57 @@ namespace DumpSymbolicate
                 frame.start_col = seq.StartColumn;
                 frame.end_line = seq.EndLine;
                 frame.end_col = seq.EndColumn;
-                frame.file = seq.Document.Url;
+                frame.file = seq.Filename;
                 break;
             }
 
             var typ = Types[method_idx];
-            frame.assembly = typ.Item1;
-            frame.klass = typ.Item2;
-            frame.function = typ.Item3;
+            frame.assembly = typ.Assembly;
+            frame.klass = typ.Class;
+            frame.function = typ.Function;
 
             // Console.WriteLine("Made frame: {0} {1} {2} {3} {4}", frame.assembly, frame.klass, frame.function, frame.file, frame.start_line);
+
+            return true;
+        }
+
+        public void Serialize (string filename)
+        {
+            using (var stream = File.Create (filename + ".gz"))
+            {
+                using (var compressedStream = new GZipStream(stream, CompressionMode.Compress))
+                {
+                    using (var streamWriter = new StreamWriter(compressedStream))
+                    {
+                        var serializer = new JsonSerializer();
+                        serializer.Serialize(streamWriter, this);
+                    }
+                }
+            }
+        }
+
+        public static CodeCollection Deserialize (string filename)
+        {
+            using (var stream = File.OpenRead (filename))
+            {
+                using (var decompressedStream = new GZipStream (stream, CompressionMode.Decompress))
+                {
+                    using (var streamReader = new StreamReader(decompressedStream))
+                    {
+                        var serializer = new JsonSerializer();
+
+                        var reader = new JsonTextReader(streamReader);
+                        return serializer.Deserialize<CodeCollection>(reader);
+                    }
+                }
+            }
         }
     }
 
     class SymbolicationRequest
     {
         public readonly MonoStateThread[] Threads;
+        public NativeMapper NativeMapper { get; set; }
 
         public static MonoStateFrame []
         ParseFrames (JArray frames)
@@ -246,12 +492,11 @@ namespace DumpSymbolicate
             for (int i = 0; i < frames.Count; i++)
             {
                 var frame = ((JObject) frames[i]);
-                //Console.WriteLine (frame.ToString ());
 
                 if (!frame.ContainsKey("is_managed") || (string)(frame["is_managed"]) != "true") {
                     var added = new MonoStateUnmanagedFrame();
                     added.address = (string)frame["native_address"];
-                    Console.WriteLine ("Native address: {0}", added.address);
+
                     output [i] = added;
                 } else {
                     var added = new MonoStateManagedFrame();
@@ -264,12 +509,12 @@ namespace DumpSymbolicate
             return output;
         }
 
-        public SymbolicationRequest (JObject input) {
+        public SymbolicationRequest (JObject input, NativeMapper mapper) {
             var payload = input["payload"];
             var version = payload["protocol_version"];
             var crash_threads = (JArray)payload["threads"];
 
-            Console.WriteLine("There were {0} threads", crash_threads.Count);
+            NativeMapper = mapper;
 
             Threads = new MonoStateThread [crash_threads.Count];
 
@@ -285,7 +530,7 @@ namespace DumpSymbolicate
             }
         }
 
-        public void Process (CodeCollection code)
+        public void Process (List<CodeCollection> maps)
         {
             foreach (var thread in Threads)
             {
@@ -293,18 +538,31 @@ namespace DumpSymbolicate
                     continue;
                 
                 foreach (var frame in thread.ManagedFrames)
-                    ProcessOne (code, frame);
+                    ProcessOne (maps, frame);
+
                 foreach (var frame in thread.NativeFrames)
-                    ProcessOne(code, frame);
+                    ProcessOne(maps, frame);
             }
         }
 
-        public void ProcessOne (CodeCollection code, MonoStateFrame frame)
+        public void ProcessOne (List<CodeCollection> maps, MonoStateFrame frame)
         {
-            if (frame is MonoStateManagedFrame)
-                code.Enrich(frame as MonoStateManagedFrame);
-            else if (frame is MonoStateUnmanagedFrame)
-                code.Enrich(frame as MonoStateUnmanagedFrame);
+            if (frame is MonoStateManagedFrame managedFrame)
+            {
+                foreach (var map in maps)
+                {
+                    if (map.TryEnrich(managedFrame))
+                    {
+                        break;
+                    }
+                }
+            }
+            else if (frame is MonoStateUnmanagedFrame unmanagedFrame)
+            {
+                NativeMapper.Enrich(unmanagedFrame);
+            }
+
+            return;
         }
 
         public void Emit(string filename)
@@ -332,11 +590,6 @@ namespace DumpSymbolicate
     class Symbolicator
     {
         static Stopwatch stopwatch = new Stopwatch ();
-        static long readingJson;
-        static long createRequest;
-        static long findAssemblies;
-        static long readingAssemblies;
-        static long symbolicate;
 
         public static string FormatFrame(MonoStateFrame frame)
         {
@@ -349,12 +602,14 @@ namespace DumpSymbolicate
         {
         }
 
+        static readonly ReaderParameters readerParameters = new ReaderParameters { ReadSymbols = true };
+        static readonly ReaderParameters readerParametersNoSymbols = new ReaderParameters { ReadSymbols = false };
+
         // Here is where we put any workarounds for file format issues
         public static JObject TryReadJson (string filePath)
         {
             var allText = File.ReadAllText(filePath);
-            // Console.WriteLine("Read in: {0}", outputStr);
-            // Console.ReadLine();
+
             JObject crashFile = null;
             try
             {
@@ -375,131 +630,179 @@ namespace DumpSymbolicate
             return crashFile;
         }
 
-        static List<string> GetAllAssemblies (string path)
+        static void GetAllAssemblies (string path, CodeCollection mapping)
         {
-            var assemblies = new List<string> ();
-
             foreach (var s in Directory.EnumerateFiles (path, "*", SearchOption.AllDirectories)) {
                 if (s.EndsWith (".exe", StringComparison.Ordinal) || s.EndsWith (".dll", StringComparison.Ordinal)) {
-                    assemblies.Add (s);
+                    ParseAssembly (s, mapping);
                 }
             }
-
-            return assemblies;
         }
 
-        static List<string> FindAssemblies (string vsPath, string monoPath)
+        static void ParseAssembly (string assemblyPath, CodeCollection mapping)
         {
-            var files = new List<string>();
-           
-            files.AddRange (GetAllAssemblies (vsPath));
-            files.AddRange (GetAllAssemblies (monoPath));
+            AssemblyDefinition myLibrary = null;
+            try
+            {
+                var readerParams = File.Exists(Path.ChangeExtension(assemblyPath, ".pdb")) ? readerParameters : readerParametersNoSymbols;
+                myLibrary = AssemblyDefinition.ReadAssembly(assemblyPath, readerParams);
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("Error parsing assembly {1}: {0}", e.Message, assemblyPath);
+                return;
+            }
+
+            string mvid = myLibrary.MainModule.Mvid.ToString().ToUpper();
+
+            foreach (var ty in myLibrary.MainModule.Types)
+            {
+                for (int i = 0; i < ty.Methods.Count; i++)
+                {
+                    string klass = ty.FullName;
+                    string function = ty.Methods[i].FullName;
+                    uint token = Convert.ToUInt32(ty.Methods[i].MetadataToken.ToInt32());
+                    mapping.Add(assemblyPath, klass, function, mvid, token, ty.Methods[i].DebugInformation.SequencePoints);
+                }
+            }
+            myLibrary.Dispose();
+        }
+
+        static CodeCollection CreateMappingForPath (string path, string monoPath)
+        {
+            var mapping = new CodeCollection();
+
+            GetAllAssemblies(path, mapping);
+
+            return mapping;
+        }
+
+        static List<CodeCollection> FindAssemblies (string vsPath, string monoPath, string monoExePath, string vsIndex, string monoIndex)
+        {
+            var maps = new List<CodeCollection>();
+
+            if (string.IsNullOrEmpty(vsIndex))
+            {
+                maps.Add(CreateMappingForPath(vsPath, monoExePath));
+            }
+            else
+            {
+                maps.Add(CodeCollection.Deserialize (vsIndex));
+            }
+
+            if (string.IsNullOrEmpty(monoIndex))
+            {
+                maps.Add(CreateMappingForPath(monoPath, monoExePath));
+            }
+            else
+            {
+                maps.Add(CodeCollection.Deserialize (monoIndex));
+            }
 
             var home = Environment.GetFolderPath (Environment.SpecialFolder.Personal);
             var addin = Path.Combine (home, "Library/Application Support/VisualStudio/7.0/LocalInstall/Addins");
             if (Directory.Exists (addin)) {
-                files.AddRange(Directory.GetFiles(addin, "*.dll", SearchOption.AllDirectories));
+                maps.Add(CreateMappingForPath(addin, monoExePath));
             }
 
-            return files;
+            return maps;
         }
 
         public static void Main(string[] args)
         {
-            if (args.Length < 1)
-                throw new Exception("Symbolcation file not provided");
+            var outputFile = "CrashReportSymbolicated.json";
+            string vsFolder = null;
+            string vsIndex = null;
+            string monoPrefix = null;
+            string monoIndex = null;
+            string crashPath = null;
+            string indexFile = null;
+            string nativeIndex = null;
+            bool shouldShowHelp = false;
 
-            if (!File.Exists(args[0]))
-                throw new Exception(String.Format("Symbolcation file not found {0}", args[0]));
+            var options = new OptionSet {
+                { "crashFile=", "The path to CrashReport.txt", n => crashPath = n },
+                { "outputFile=", "The filename of the symbolicated crash report", n => outputFile = n },
+                { "vsmacPath=", "The path to the VSMac folder", n => vsFolder = n },
+                { "vsmacIndex=", "The path to the VSMac symbol index file", n => vsIndex = n },
+                { "monoPath=", "The path to the Mono folder", n => monoPrefix = n },
+                { "monoIndex=", "The path to the Mono symbol index file", n => monoIndex = n },
+                { "generateIndexFile=", "The filename of the index file", n => indexFile = n },
+                { "monoNativeIndex=", "The managed symbol index file", n => nativeIndex = n },
+                { "help", "Print help", n => shouldShowHelp = n != null }
+            };
 
-            Console.WriteLine ("Reading crash JSON");
-            stopwatch.Start();
-            var crashFile = Symbolicator.TryReadJson(args[0]);
-            readingJson = stopwatch.ElapsedMilliseconds;
-
-            Console.WriteLine ("Creating request");
-            stopwatch.Restart ();
-            var request = new SymbolicationRequest(crashFile);
-            createRequest = stopwatch.ElapsedMilliseconds;
-
-            if (args.Length < 2)
-                throw new Exception("Symbolcation folder not provided");
-
-            var vsFolder = args[1];
-
-            if (args.Length < 3)
-                throw new Exception("Unmanaged mono not given");
-
-            var monoPrefix = args [2];
-            var monoPath = Path.Combine(monoPrefix, "bin", "mono");
-
-            string outputFile = "CrashReportSymbolicated.json";
-            if (args.Length == 4) {
-                outputFile = args[3];
+            List<string> extra;
+            try
+            {
+                extra = options.Parse (args);
+            }
+            catch (OptionException e)
+            {
+                Console.Write("DumpSymbolicate.exe: ");
+                Console.WriteLine(e.Message);
+                Console.WriteLine("Try `DumpSymbolicate.exe --help' for more information.");
+                return;
             }
 
-            Console.WriteLine ("Finding assemblies");
+            if (shouldShowHelp) {
+                ShowHelp (options);
+                return;
+            }
+
+            stopwatch.Start();
+
+            string monoPath = null;
+            if (!string.IsNullOrEmpty(monoPrefix))
+            {
+                monoPath = Path.Combine(monoPrefix, "bin", "mono");
+            }
+            var nativeMapper = new NativeMapper(nativeIndex) { MonoExePath = monoPath };
+
+            SymbolicationRequest request = null;
+            long readingJson = 0, createRequest = 0;
+            if (!string.IsNullOrEmpty(crashPath))
+            {
+                var crashFile = TryReadJson(crashPath);
+                readingJson = stopwatch.ElapsedMilliseconds;
+
+                stopwatch.Restart();
+                request = new SymbolicationRequest(crashFile, nativeMapper);
+                createRequest = stopwatch.ElapsedMilliseconds;
+            }
 
             // Only load assemblies for which we have debug info
             stopwatch.Restart ();
-            var assemblies = FindAssemblies(vsFolder, monoPrefix);
-            findAssemblies = stopwatch.ElapsedMilliseconds;
+            var maps = FindAssemblies(vsFolder, monoPrefix, monoPath, vsIndex, monoIndex);
+            var processAssemblies = stopwatch.ElapsedMilliseconds;
 
-            Console.WriteLine ("Traversing {0} assemblies", assemblies.Count);
-
-            var mapping = new CodeCollection (monoPath);
-
-            var readerParameters = new ReaderParameters { ReadSymbols = true };
-            var readerParametersNoSymbols = new ReaderParameters { ReadSymbols = false };
-
-            // AppDomain safe_domain = AppDomain.CreateDomain("SafeDomain");
-            stopwatch.Restart ();
-            foreach (string assembly in assemblies)
-            {
-                AssemblyDefinition myLibrary = null;
-                try
-                {
-                    var readerParams = File.Exists(Path.ChangeExtension(assembly, ".pdb")) ? readerParameters : readerParametersNoSymbols;
-                    myLibrary = AssemblyDefinition.ReadAssembly(assembly, readerParams);
-                }
-                catch (Exception e)
-                {
-                    Console.WriteLine("Error parsing assembly {1}: {0}", e.Message, assembly);
-                    continue;
-                }
-
-                string mvid = myLibrary.MainModule.Mvid.ToString ().ToUpper ();
-
-                Console.WriteLine("{0} {1}", assembly, mvid);
-                Console.WriteLine("Read {0}", assembly);
-
-                foreach (var ty in myLibrary.MainModule.Types){
-                    for (int i = 0; i < ty.Methods.Count; i++)
-                    {
-                        string klass = ty.FullName;
-                        string function = ty.Methods[i].FullName;
-                        uint token = Convert.ToUInt32 (ty.Methods[i].MetadataToken.ToInt32());
-                        mapping.Add (assembly, klass, function, mvid, token, ty.Methods [i].DebugInformation.SequencePoints);
-                    }
-                }
-                myLibrary.Dispose();
+            stopwatch.Restart();
+            if (!string.IsNullOrEmpty(indexFile)) {
+                maps[0].Serialize(indexFile + "-vsmac.json");
+                maps[1].Serialize(indexFile + "-mono.json");
             }
-            readingAssemblies = stopwatch.ElapsedMilliseconds;
+            var creatingIndex = stopwatch.ElapsedMilliseconds;
 
             stopwatch.Restart ();
-            request.Process(mapping);
-            symbolicate = stopwatch.ElapsedMilliseconds;
 
-            request.Emit(outputFile);
-            mapping.Shutdown ();
+            long symbolicate = 0;
+            if (request != null)
+            {
+                request.Process(maps);
+                symbolicate = stopwatch.ElapsedMilliseconds;
+
+                request.Emit(outputFile);
+            }
+
+            nativeMapper.Shutdown ();
 
             stopwatch.Stop ();
 
             Console.WriteLine ("Timings\n-------");
             Console.WriteLine ($"   Reading crash log: {readingJson}ms");
             Console.WriteLine ($"   Creating request: {createRequest}ms");
-            Console.WriteLine ($"   Finding assemblies: {findAssemblies}ms");
-            Console.WriteLine ($"   Reading assemblies: {readingAssemblies}ms");
+            Console.WriteLine ($"   Processing assemblies: {processAssemblies}ms");
+            Console.WriteLine ($"   Writing indexes: {creatingIndex}ms");
             Console.WriteLine ($"   Symbolification: {symbolicate}ms");
 
             //var MonoState = new MonoStateParser (argv [1]);
@@ -508,6 +811,15 @@ namespace DumpSymbolicate
             //FormatFrame (frame);
 
             // AppDomain.Unload(safe_domain);
+        }
+
+        static void ShowHelp (OptionSet options)
+        {
+            Console.WriteLine("Usage: DumpSymbolicate.exe [OPTIONS]");
+            Console.WriteLine("Symbolicate a VSMac crash report");
+            Console.WriteLine();
+            Console.WriteLine("Options:");
+            options.WriteOptionDescriptions(Console.Out);
         }
     }
 }
